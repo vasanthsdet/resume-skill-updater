@@ -1,24 +1,40 @@
 """
 Scans every job section in the resume and removes duplicate bullet points.
 
-Strategy:
-  - Process jobs in order (Toyota → Equifax → UST → Availity → Sana Technos)
-  - Keep the FIRST occurrence of a bullet; delete all later copies
-  - Also catches near-duplicates (>82% word overlap via Jaccard similarity)
-  - Blank separators / company headers / education are never touched
+Two-pass strategy:
+  Pass 1 — Jaccard (fast, no API):
+    Process jobs in order (Toyota -> Equifax -> UST -> Availity -> Sana Technos).
+    Keep the FIRST occurrence; remove exact and near-duplicate (>82% word overlap)
+    copies in later jobs.
+
+  Pass 2 — AI within-job (Claude Haiku, --ai flag):
+    For each job independently, ask Claude to identify bullets that:
+      - Cover the same topic as another bullet in the same job
+      - Reference outdated/obsolete tools
+      - Are too generic for the role
+    Removes the weaker duplicate, keeping the more specific bullet.
 
 Usage:
-  python deduplicate.py                            # reads & overwrites resume/base_resume.docx
-  python deduplicate.py --input in.docx --output out.docx
-  python deduplicate.py --dry-run                  # shows what would be removed, no file change
+  python deduplicate.py                   # Jaccard pass only, reads/overwrites resume/base_resume.docx
+  python deduplicate.py --ai              # Jaccard + AI pass (recommended for within-job clean-up)
+  python deduplicate.py --dry-run --ai    # Preview both passes, no file written
+  python deduplicate.py --input in.docx --output out.docx --ai
 """
 
+import os
 import re
+import json
 import argparse
+import httpx
+import anthropic
 from docx import Document
+from dotenv import load_dotenv
 
-EXPERIENCE_KEYWORDS  = {"professional experience", "work experience", "employment history"}
-SIMILARITY_THRESHOLD = 0.82   # Jaccard word-overlap ratio to flag near-duplicates
+load_dotenv()
+
+EXPERIENCE_KEYWORDS   = {"professional experience", "work experience", "employment history"}
+CROSS_JOB_THRESHOLD   = 0.82   # Jaccard threshold for cross-job exact/near-duplicates
+WITHIN_JOB_THRESHOLD  = 0.50   # Jaccard threshold for within-job near-duplicates
 
 
 # ---------------------------------------------------------------------------
@@ -62,15 +78,12 @@ def _find_experience_heading(doc: Document) -> int:
 
 
 def _find_all_job_blocks(doc: Document, exp_heading_idx: int) -> list[tuple[str, list[int]]]:
-    """
-    Return [(job_label, [bullet_para_idxs]), ...] for every job found
-    after the experience section heading.
-    """
-    paras  = doc.paragraphs
+    """Return [(job_label, [bullet_para_idxs]), ...] for every job after the experience heading."""
+    paras   = doc.paragraphs
     jobs: list[tuple[str, list[int]]] = []
-    label  = ""
+    label   = ""
     bullets: list[int] = []
-    in_job = False
+    in_job  = False
     i = exp_heading_idx + 1
 
     while i < len(paras):
@@ -85,7 +98,6 @@ def _find_all_job_blocks(doc: Document, exp_heading_idx: int) -> list[tuple[str,
         ):
             break
 
-        # "Company | Location   Date" — pipe identifies a company header line
         if " | " in text:
             if in_job:
                 jobs.append((label, bullets[:]))
@@ -93,7 +105,6 @@ def _find_all_job_blocks(doc: Document, exp_heading_idx: int) -> list[tuple[str,
             bullets = []
             in_job  = True
             i += 1
-            # Consume the job-title line (short, no pipe, no year)
             if i < len(paras):
                 nxt = paras[i].text.strip()
                 if nxt and len(nxt) < 70 and " | " not in nxt and not re.search(r"\d{4}", nxt):
@@ -116,32 +127,25 @@ def _remove_para(para) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Core deduplication
+# Pass 1 — Jaccard cross-job deduplication
 # ---------------------------------------------------------------------------
 
-def deduplicate(input_path: str, output_path: str, dry_run: bool = False) -> int:
+def _jaccard_pass(
+    paras: list,
+    jobs: list[tuple[str, list[int]]],
+    dry_run: bool,
+) -> list[int]:
     """
-    Remove duplicate bullets across all job blocks.
-    Returns the number of paragraphs removed.
+    Cross-job deduplication: keep first occurrence, remove later copies.
+    Also catches within-job near-duplicates above WITHIN_JOB_THRESHOLD.
+    Returns list of para indices to remove.
     """
-    doc   = Document(input_path)
-    paras = doc.paragraphs
-
-    exp_idx = _find_experience_heading(doc)
-    if exp_idx < 0:
-        print("  [dedup] Experience section not found — nothing to do.")
-        if not dry_run:
-            doc.save(output_path)
-        return 0
-
-    jobs = _find_all_job_blocks(doc, exp_idx)
-    print(f"  [dedup] {len(jobs)} job block(s) found")
-
     seen_exact: set[str]  = set()
-    seen_list:  list[str] = []     # kept for Jaccard comparison
+    seen_cross: list[str] = []   # for cross-job Jaccard
     to_remove:  list[int] = []
 
     for job_label, bullet_idxs in jobs:
+        seen_within: list[str] = []   # reset per job for within-job Jaccard
         removed_here: list[str] = []
 
         for idx in bullet_idxs:
@@ -150,48 +154,187 @@ def deduplicate(input_path: str, output_path: str, dry_run: bool = False) -> int
                 continue
             norm = _normalize(text)
 
-            # Exact duplicate
+            # Exact match (cross-job or within-job)
             if norm in seen_exact:
                 to_remove.append(idx)
-                removed_here.append(text[:80])
+                removed_here.append(text[:90])
                 continue
 
-            # Near-duplicate
-            if any(_jaccard(norm, s) >= SIMILARITY_THRESHOLD for s in seen_list):
+            # Within-job near-duplicate (lower threshold)
+            if any(_jaccard(norm, s) >= WITHIN_JOB_THRESHOLD for s in seen_within):
                 to_remove.append(idx)
-                removed_here.append(text[:80])
+                removed_here.append(text[:90])
                 continue
 
-            # First occurrence — mark as seen
+            # Cross-job near-duplicate (higher threshold)
+            if any(_jaccard(norm, s) >= CROSS_JOB_THRESHOLD for s in seen_cross):
+                to_remove.append(idx)
+                removed_here.append(text[:90])
+                continue
+
             seen_exact.add(norm)
-            seen_list.append(norm)
+            seen_within.append(norm)
+            seen_cross.append(norm)
 
         if removed_here:
-            short_label = job_label.split("|")[0].strip()[:30]
-            print(f"  [dedup] {short_label}: {len(removed_here)} duplicate(s) removed")
+            short = job_label.split("|")[0].strip()[:30]
+            print(f"  [Jaccard] {short}: {len(removed_here)} removed")
             for t in removed_here:
-                print(f"          - {t}...")
+                print(f"    - {t}...")
 
-    if not to_remove:
-        print("  [dedup] No duplicates found.")
+    return to_remove
+
+
+# ---------------------------------------------------------------------------
+# Pass 2 — AI within-job deduplication
+# ---------------------------------------------------------------------------
+
+def _ai_dedup_job(job_label: str, bullets: list[str]) -> list[int]:
+    """
+    Ask Claude Haiku to identify redundant bullet indices within one job.
+    Returns 0-based indices of bullets to remove.
+    """
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set — add it to .env")
+    client = anthropic.Anthropic(api_key=key, http_client=httpx.Client(verify=False))
+
+    numbered = "\n".join(f"{i}. {b}" for i, b in enumerate(bullets))
+
+    prompt = f"""You are reviewing bullet points for this resume job section: {job_label}
+
+Identify bullets to REMOVE because they:
+1. Cover the same topic as another bullet in this list — keep the more specific/detailed one, remove the vaguer one
+2. Reference outdated or obsolete tools (e.g. Firebug was discontinued in 2017 and should not appear in a 2024-2025 role)
+3. Are too generic for a Senior QA/SDET Engineer (e.g. "Experienced with POM pattern", "Followed Agile-Scrum process")
+
+BULLETS:
+{numbered}
+
+Rules:
+- Only remove clear duplicates or obvious problems. When in doubt, keep the bullet.
+- For topic duplicates, prefer the bullet with more detail and concrete outcomes.
+- Return ONLY a valid JSON array of 0-based indices to remove. Example: [2, 7, 12]
+- If nothing should be removed, return: []"""
+
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = resp.content[0].text.strip()
+    # Extract the first JSON array found anywhere in the response
+    match = re.search(r"\[[\d,\s]*\]", raw)
+    if not match:
+        return []
+    result = json.loads(match.group())
+    return [int(x) for x in result if isinstance(x, (int, float))]
+
+
+def _ai_pass(
+    paras: list,
+    jobs: list[tuple[str, list[int]]],
+    already_removed: set[int],
+    dry_run: bool,
+) -> list[int]:
+    """
+    For each job, use AI to find topic-based duplicates the Jaccard pass missed.
+    Returns additional para indices to remove.
+    """
+    to_remove: list[int] = []
+
+    for job_label, bullet_idxs in jobs:
+        # Work only on bullets that survived the Jaccard pass
+        live_idxs   = [i for i in bullet_idxs if i not in already_removed]
+        live_bullets = [paras[i].text.strip() for i in live_idxs if paras[i].text.strip()]
+        live_idxs    = [i for i in live_idxs if paras[i].text.strip()]
+
+        if len(live_bullets) < 2:
+            continue
+
+        short = job_label.split("|")[0].strip()[:30]
+        print(f"  [AI] Scanning {short} ({len(live_bullets)} bullets)...")
+
+        try:
+            remove_positions = _ai_dedup_job(job_label, live_bullets)
+        except Exception as e:
+            print(f"  [AI] Skipped {short} due to error: {e}")
+            continue
+
+        removed_here: list[str] = []
+        for pos in remove_positions:
+            if 0 <= pos < len(live_idxs):
+                para_idx = live_idxs[pos]
+                to_remove.append(para_idx)
+                removed_here.append(live_bullets[pos][:90])
+
+        if removed_here:
+            print(f"  [AI] {short}: {len(removed_here)} removed")
+            for t in removed_here:
+                print(f"    - {t}...")
+        else:
+            print(f"  [AI] {short}: nothing to remove")
+
+    return to_remove
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def deduplicate(
+    input_path: str,
+    output_path: str,
+    dry_run: bool = False,
+    use_ai: bool  = False,
+) -> int:
+    """
+    Remove duplicate bullets. Returns total count removed.
+    """
+    doc   = Document(input_path)
+    paras = doc.paragraphs
+
+    exp_idx = _find_experience_heading(doc)
+    if exp_idx < 0:
+        print("  [dedup] Experience section not found.")
+        if not dry_run:
+            doc.save(output_path)
+        return 0
+
+    jobs = _find_all_job_blocks(doc, exp_idx)
+    print(f"  Found {len(jobs)} job block(s)\n")
+
+    # Pass 1 — Jaccard
+    print("Pass 1 — Jaccard (exact + similarity):")
+    jaccard_remove = _jaccard_pass(paras, jobs, dry_run)
+
+    # Pass 2 — AI
+    ai_remove: list[int] = []
+    if use_ai:
+        print("\nPass 2 — AI (within-job topic analysis):")
+        ai_remove = _ai_pass(paras, jobs, set(jaccard_remove), dry_run)
+
+    all_remove = sorted(set(jaccard_remove + ai_remove))
+    total = len(all_remove)
+
+    if not total:
+        print("\nNo duplicates found.")
         if not dry_run:
             doc.save(output_path)
         return 0
 
     if dry_run:
-        print(f"\n  [dry-run] Would remove {len(to_remove)} bullet(s). No file written.")
-        return len(to_remove)
+        print(f"\n[dry-run] Would remove {total} bullet(s) total. No file written.")
+        return total
 
-    # Collect paragraph objects before removal (indices shift after each delete)
-    paras_to_remove = [doc.paragraphs[i] for i in sorted(set(to_remove))]
-
+    paras_to_remove = [doc.paragraphs[i] for i in all_remove]
     for para in paras_to_remove:
         _remove_para(para)
 
     doc.save(output_path)
-    print(f"\n  [dedup] Done — {len(to_remove)} duplicate bullet(s) removed.")
-    print(f"  [dedup] Saved -> {output_path}")
-    return len(to_remove)
+    print(f"\nDone — {total} duplicate bullet(s) removed.")
+    print(f"Saved -> {output_path}")
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -200,15 +343,16 @@ def deduplicate(input_path: str, output_path: str, dry_run: bool = False) -> int
 
 def main():
     parser = argparse.ArgumentParser(description="Remove duplicate resume bullet points")
-    parser.add_argument("--input",   default="resume/base_resume.docx", help="Input .docx")
-    parser.add_argument("--output",  default="resume/base_resume.docx", help="Output .docx (default: overwrite input)")
-    parser.add_argument("--dry-run", action="store_true",               help="Preview changes without writing")
+    parser.add_argument("--input",   default="resume/base_resume.docx")
+    parser.add_argument("--output",  default="resume/base_resume.docx")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only, no file change")
+    parser.add_argument("--ai",      action="store_true", help="Use AI for within-job topic dedup (recommended)")
     args = parser.parse_args()
 
-    print(f"Reading: {args.input}")
-    removed = deduplicate(args.input, args.output, dry_run=args.dry_run)
+    print(f"Reading: {args.input}\n")
+    removed = deduplicate(args.input, args.output, dry_run=args.dry_run, use_ai=args.ai)
     if not args.dry_run:
-        print(f"Saved:   {args.output}  ({removed} bullets removed)")
+        print(f"Total removed: {removed}")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ import shutil
 import os
 import re
 import json
+import httpx
 import anthropic
 from docx import Document
 from dotenv import load_dotenv
@@ -32,7 +33,7 @@ def _client() -> anthropic.Anthropic:
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY not set — add it to .env")
-    return anthropic.Anthropic(api_key=key)
+    return anthropic.Anthropic(api_key=key, http_client=httpx.Client(verify=False))
 
 
 # ---------------------------------------------------------------------------
