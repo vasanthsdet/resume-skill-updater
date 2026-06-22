@@ -28,6 +28,7 @@ from dotenv import load_dotenv
 from skill_extractor import extract_skills
 from resume_updater import update_resume
 from email_sender import send_resume_email
+from bold_skills import apply_bold_formatting
 
 load_dotenv()
 
@@ -111,14 +112,16 @@ def main() -> None:
 
     # ── Step 2: Update resume ─────────────────────────────────────
     safe_title  = re.sub(r"[^\w\s-]", "", args.job_title).strip().replace(" ", "_")[:50]
-    output_path = os.path.join(args.output_dir, f"Resume_{safe_title}.docx")
+    output_path = os.path.abspath(os.path.join(args.output_dir, f"Resume_{safe_title}.docx"))
     os.makedirs(args.output_dir, exist_ok=True)
 
     step = "3" if args.skills else "3"
-    print(f"[{step}/3] Updating resume → {output_path}")
+    print(f"[{step}/3] Updating resume -> {output_path}")
     output_path, change_log = update_resume(args.base, skills, output_path)
     print(f"      Saved: {output_path}")
     print(f"      {len(change_log)} bullets changed across all sections")
+    print(f"      Applying bold formatting...")
+    apply_bold_formatting(output_path, output_path)
 
     # ── Step 3: Email ─────────────────────────────────────────────
     if args.send_email:

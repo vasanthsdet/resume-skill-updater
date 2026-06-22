@@ -9,12 +9,10 @@ Usage:
   python bold_skills.py --input resume/Revathi_Battina_Resume.docx --output resume/Revathi_Battina_Resume.docx
 """
 
-import re, shutil, argparse, copy
+import re, shutil, argparse
 from docx import Document
-from lxml import etree
 
-NS    = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-XML_NS = "http://www.w3.org/XML/1998/namespace"
+NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 SUMMARY_KEYWORDS    = {"professional summary", "summary", "profile", "objective"}
 SKILLS_KEYWORDS     = {"technical skills", "skills", "core competencies", "expertise"}
@@ -110,30 +108,9 @@ def _find_all_job_blocks(doc, exp_heading_idx):
     return jobs
 
 
-# ── Low-level XML run helpers ──────────────────────────────────────────────────
-
-def _set_run_bold_xml(r_elem, is_bold: bool):
-    """Set <w:b> and <w:bCs> directly on a <w:r> XML element."""
-    rpr = r_elem.find(f"{{{NS}}}rPr")
-    if rpr is None:
-        rpr = etree.Element(f"{{{NS}}}rPr")
-        r_elem.insert(0, rpr)
-
-    for tag in (f"{{{NS}}}b", f"{{{NS}}}bCs"):
-        for old in rpr.findall(tag):
-            rpr.remove(old)
-
-    b   = etree.Element(f"{{{NS}}}b")
-    bcs = etree.Element(f"{{{NS}}}bCs")
-    if not is_bold:
-        b.set(f"{{{NS}}}val", "0")
-        bcs.set(f"{{{NS}}}val", "0")
-    rpr.insert(0, bcs)
-    rpr.insert(0, b)
-
 
 def _remove_ppr_bold(para):
-    """Strip bold from paragraph-level default run properties so runs control it."""
+    """Strip bold from paragraph-level run defaults so run-level bold controls it."""
     ppr = para._element.find(f"{{{NS}}}pPr")
     if ppr is None:
         return
@@ -145,54 +122,28 @@ def _remove_ppr_bold(para):
             rpr.remove(elem)
 
 
-def _rewrite_runs(para, segments: list[tuple[str, bool]]):
-    """
-    Replace every <w:r> in the paragraph with one run per segment.
+def _rewrite_runs(para, segments: list[tuple[str, bool | None]]):
+    """Replace paragraph runs with new segments, setting bold via python-docx API."""
+    # Capture font properties before clearing
+    first_run = para.runs[0] if para.runs else None
+    font_name = first_run.font.name if first_run else None
+    font_size = first_run.font.size if first_run else None
 
-    Strategy: deepcopy the first existing run (preserves font/size/colour/etc.),
-    then update only the bold flag and text.  Insert runs at the exact position
-    where the original first run sat so ordering stays correct.
-    """
-    existing = para._element.findall(f"{{{NS}}}r")
-    if not existing:
-        # Fallback: no existing runs — use add_run
-        for text, is_bold in segments:
-            if text:
-                r = para.add_run(text)
-                r.bold = is_bold
-        return
-
-    ref    = existing[0]
+    # Remove all existing runs at the XML level
     p_elem = para._element
-    children = list(p_elem)
-    insert_at = children.index(ref)
+    for r_elem in list(p_elem.findall(f"{{{NS}}}r")):
+        p_elem.remove(r_elem)
 
-    # Remove all existing runs
-    for r in existing:
-        p_elem.remove(r)
-
-    # Insert new runs in their place
-    offset = 0
+    # Re-add runs using python-docx native API — handles bold XML correctly
     for text, is_bold in segments:
         if not text:
             continue
-
-        new_r = copy.deepcopy(ref)
-
-        # Update bold
-        _set_run_bold_xml(new_r, is_bold)
-
-        # Replace text nodes
-        for t_elem in new_r.findall(f"{{{NS}}}t"):
-            new_r.remove(t_elem)
-        t_elem = etree.Element(f"{{{NS}}}t")
-        t_elem.text = text
-        if text != text.strip():           # has leading/trailing spaces
-            t_elem.set(f"{{{XML_NS}}}space", "preserve")
-        new_r.append(t_elem)
-
-        p_elem.insert(insert_at + offset, new_r)
-        offset += 1
+        run = para.add_run(text)
+        run.bold = is_bold
+        if font_name:
+            run.font.name = font_name
+        if font_size:
+            run.font.size = font_size
 
 
 # ── Skill-term pattern ─────────────────────────────────────────────────────────
@@ -228,10 +179,7 @@ def format_skills_line(para):
     if c < 0:
         return
     _remove_ppr_bold(para)
-    segments = [(text[:c + 1], True)]
-    if text[c + 1:]:
-        segments.append((text[c + 1:], False))
-    _rewrite_runs(para, segments)
+    _rewrite_runs(para, [(text[:c + 1], True), (text[c + 1:], False)])
 
 
 def bold_skills_in_bullet(para, pattern: re.Pattern):
@@ -242,6 +190,9 @@ def bold_skills_in_bullet(para, pattern: re.Pattern):
     segs = _split_segments(text, pattern)
     if not any(bold for _, bold in segs):
         return
+    # Use None (inherit style) for non-matched text — avoids explicit <w:b val="0"/>
+    # conflicting with the paragraph's default non-bold style
+    segs = [(t, True if b else None) for t, b in segs]
     _rewrite_runs(para, segs)
 
 

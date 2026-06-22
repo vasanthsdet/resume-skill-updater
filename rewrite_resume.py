@@ -19,6 +19,7 @@ import copy, os, re, json, shutil, httpx, argparse
 import anthropic
 from docx import Document
 from dotenv import load_dotenv
+from bold_skills import apply_bold_formatting
 
 load_dotenv()
 
@@ -276,6 +277,9 @@ def rewrite_resume(input_path: str, output_path: str) -> str:
 
     doc.save(output_path)
     print(f"Saved -> {output_path}")
+
+    print("Applying bold formatting...")
+    apply_bold_formatting(output_path, output_path)
     return output_path
 
 
