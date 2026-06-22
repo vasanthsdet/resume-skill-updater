@@ -1,0 +1,96 @@
+name: Update & Email Resume
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      recruiter_requirements:
+        description: |
+          Paste the full recruiter requirements text here.
+          Example:
+            6+ years SDET experience. Experience with Playwright, Cypress.
+            Languages: JavaScript, TypeScript, C#, SQL.
+            Cloud: AWS or Azure. Observability: DataDog, Splunk.
+            CI/CD: Azure DevOps, GitHub Actions, NPM.
+        required: true
+        type: string
+
+      job_title:
+        description: "Job title (used in the output filename and email subject)"
+        required: false
+        default: "QA_Engineer"
+        type: string
+
+      email_recipients:
+        description: |
+          Comma-separated list of email addresses to receive the updated resume.
+          Leave blank to use the EMAIL_RECIPIENTS secret.
+          Example: hr@company.com, you@gmail.com
+        required: false
+        default: ""
+        type: string
+
+      send_email:
+        description: "Send updated resume via email after generation?"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+jobs:
+  update-resume:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write recruiter requirements to file
+        run: |
+          cat > recruiter_jd.txt << 'REQUIREMENTS_EOF'
+          ${{ github.event.inputs.recruiter_requirements }}
+          REQUIREMENTS_EOF
+
+      - name: Update resume
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+        run: |
+          # Build optional flags
+          SEND_FLAG=""
+          if [ "${{ github.event.inputs.send_email }}" = "true" ]; then
+            SEND_FLAG="--send-email"
+          fi
+
+          EMAIL_TO_FLAG=""
+          RECIPIENTS="${{ github.event.inputs.email_recipients }}"
+          if [ -n "$RECIPIENTS" ]; then
+            # Convert comma-separated string to space-separated --email-to args
+            EMAIL_TO_FLAG="--email-to $(echo "$RECIPIENTS" | tr ',' ' ')"
+          fi
+
+          python main.py \
+            --requirements-file recruiter_jd.txt \
+            --job-title "${{ github.event.inputs.job_title }}" \
+            $SEND_FLAG \
+            $EMAIL_TO_FLAG
+
+      - name: Upload tailored resume as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Resume-${{ github.event.inputs.job_title }}-${{ github.run_number }}
+          path: tailored_resumes/*.docx
+          retention-days: 30

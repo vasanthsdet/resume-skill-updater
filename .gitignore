@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+tailored_resumes/
+*.egg-info/
+.venv/
+venv/
